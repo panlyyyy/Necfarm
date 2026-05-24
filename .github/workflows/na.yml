@@ -1,0 +1,263 @@
+name: NECaptcha Daily Farmer
+
+on:
+  schedule:
+    - cron: '0 0 * * *'   # 07:00 WIB
+  workflow_dispatch:
+
+jobs:
+  farm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies (with Xvfb)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libnss3 libnspr4 libatk-bridge2.0-0 \
+            libdrm2 libxkbcommon0 libgbm1 \
+            libasound2t64 libxcomposite1 libxdamage1 \
+            libxrandr2 xvfb
+
+      - name: Install Python packages
+        run: |
+          pip install opencv-python-headless playwright requests numpy
+          playwright install chromium
+
+      - name: Create main script
+        run: |
+          cat > farm.py << 'PYEOF'
+          import asyncio, cv2, numpy as np, os, requests, time, traceback
+          from playwright.async_api import async_playwright
+
+          TARGET_URL = "https://necaptcha.jphgpt.f5.si/"
+          BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+          CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+
+          def send_telegram(text):
+              url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+              data = {"chat_id": CHAT_ID, "text": text}
+              try:
+                  r = requests.post(url, data=data, timeout=10)
+                  print(f"[TELEGRAM] Status: {r.status_code}")
+              except Exception as e:
+                  print(f"[TELEGRAM] Gagal: {e}")
+
+          async def get_slider_bounds(page):
+              selectors = [
+                  ".yidun_slider", ".yidun_slider_indicator", ".yidun_slider-btn",
+                  ".nec-captcha-slider", ".slider", "[class*='slider']", "[class*='yidun']"
+              ]
+              for sel in selectors:
+                  try:
+                      el = await page.query_selector(sel)
+                      if el:
+                          box = await el.bounding_box()
+                          if box and box["width"] > 0:
+                              return el, box
+                  except:
+                      continue
+              return None, None
+
+          async def get_puzzle_images(page):
+              # Mengambil screenshot seluruh viewport untuk dijadikan fallback
+              full_screenshot = await page.screenshot()
+              full_img = cv2.imdecode(np.frombuffer(full_screenshot, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+              bg_selectors = [
+                  ".yidun_bg-img", ".yidun_bg", "img.yidun_bg-img",
+                  ".nec-captcha-bg", "canvas.yidun_bg-img", "[class*='bg']"
+              ]
+              piece_selectors = [
+                  ".yidun_jigsaw", ".yidun_piece", ".nec-captcha-piece",
+                  ".yidun_jigsaw-img", "img.yidun_jigsaw", "[class*='jigsaw']", "[class*='piece']"
+              ]
+
+              bg_bytes = None
+              piece_bytes = None
+
+              # Coba ambil gambar background dari elemen spesifik
+              for sel in bg_selectors:
+                  try:
+                      el = await page.query_selector(sel)
+                      if el:
+                          await el.wait_for_element_state("visible", timeout=2000)
+                          bg_bytes = await el.screenshot()
+                          break
+                  except:
+                      continue
+
+              # Coba ambil gambar potongan puzzle dari elemen spesifik
+              for sel in piece_selectors:
+                  try:
+                      el = await page.query_selector(sel)
+                      if el:
+                          await el.wait_for_element_state("visible", timeout=2000)
+                          piece_bytes = await el.screenshot()
+                          break
+                  except:
+                      continue
+
+              # Jika salah satu tidak didapat, kita pakai cara alternatif dengan memotong dari screenshot penuh
+              if not bg_bytes or not piece_bytes:
+                  print("[*] Menggunakan metode fallback: memotong dari screenshot penuh...")
+                  # Asumsikan area slider ada di sekitar tengah-bawah halaman (kalibrasi bisa disesuaikan)
+                  h, w = full_img.shape[:2]
+                  # Misal area puzzle: vertikal 50%-80% tinggi, horizontal penuh
+                  bg_region = full_img[int(h*0.5):int(h*0.8), 0:w]
+                  piece_region = full_img[int(h*0.55):int(h*0.75), int(w*0.3):int(w*0.7)]  # contoh
+                  # Encode region ke bytes
+                  _, bg_encoded = cv2.imencode('.png', bg_region)
+                  _, piece_encoded = cv2.imencode('.png', piece_region)
+                  bg_bytes = bg_encoded.tobytes()
+                  piece_bytes = piece_encoded.tobytes()
+
+              return bg_bytes, piece_bytes
+
+          async def solve_slider(page):
+              slider_el, slider_box = await get_slider_bounds(page)
+              if not slider_el:
+                  print("[-] Handle slider tidak ditemukan.")
+                  return False
+
+              bg_bytes, piece_bytes = await get_puzzle_images(page)
+              if not bg_bytes or not piece_bytes:
+                  print("[-] Gambar puzzle tidak ditemukan.")
+                  return False
+
+              bg = cv2.imdecode(np.frombuffer(bg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+              piece = cv2.imdecode(np.frombuffer(piece_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+              if bg is None or piece is None:
+                  print("[-] Gagal decode gambar.")
+                  return False
+
+              bg_gray = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY)
+              piece_gray = cv2.cvtColor(piece, cv2.COLOR_BGR2GRAY)
+
+              result = cv2.matchTemplate(bg_gray, piece_gray, cv2.TM_CCOEFF_NORMED)
+              _, _, _, max_loc = cv2.minMaxLoc(result)
+              distance = max_loc[0]
+
+              if distance <= 0:
+                  print("[-] Jarak puzzle tidak valid.")
+                  return False
+
+              scale = slider_box["width"] / bg.shape[1]
+              slide_distance = distance * scale
+
+              start_x = slider_box["x"] + slider_box["width"] / 2
+              start_y = slider_box["y"] + slider_box["height"] / 2
+
+              print(f"[*] Jarak geser: {slide_distance:.1f}px")
+              await page.mouse.move(start_x, start_y)
+              await page.mouse.down()
+              steps = 50
+              for i in range(steps + 1):
+                  current_x = start_x + slide_distance * (i / steps)
+                  current_y = start_y + np.random.randint(-3, 3)
+                  await page.mouse.move(current_x, current_y)
+                  await asyncio.sleep(np.random.uniform(0.005, 0.02))
+              await page.mouse.up()
+              print("[+] Slider digeser.")
+              return True
+
+          async def capture_token(page):
+              token_captured = []
+              try:
+                  await page.expose_function("__captureToken", lambda t: token_captured.append(t))
+              except:
+                  pass
+
+              await page.evaluate("""() => {
+                  if (typeof window.initNECaptcha === 'function') {
+                      const orig = window.initNECaptcha;
+                      window.initNECaptcha = function(config) {
+                          if (config && config.onVerify) {
+                              const origVerify = config.onVerify;
+                              config.onVerify = function(token) {
+                                  try { window.__captureToken(token); } catch(e) {}
+                                  origVerify(token);
+                              };
+                          }
+                          orig(config);
+                      };
+                  }
+              }""")
+
+              token = None
+              for _ in range(60):
+                  if token_captured:
+                      token = token_captured[0]
+                      break
+                  try:
+                      token = await page.evaluate("() => localStorage.getItem('NECaptchaValidate')")
+                  except:
+                      pass
+                  if token: break
+                  try:
+                      token = await page.evaluate("() => window.NECaptchaToken || window.NECaptchaValidate")
+                  except:
+                      pass
+                  if token: break
+                  await asyncio.sleep(1)
+              return token
+
+          async def main():
+              print("[MAIN] Memulai sesi farming...")
+              try:
+                  async with async_playwright() as p:
+                      browser = await p.chromium.launch(headless=False)  # perlu display, nanti dijalankan dengan xvfb
+                      context = await browser.new_context(viewport={"width": 1280, "height": 720})
+                      page = await context.new_page()
+                      try:
+                          await page.goto(TARGET_URL, wait_until="networkidle", timeout=30000)
+                      except:
+                          print("[MAIN] Gagal memuat halaman.")
+                          await browser.close()
+                          return None
+
+                      await page.wait_for_timeout(5000)
+
+                      if not await solve_slider(page):
+                          print("[MAIN] Auto-solve gagal. Mengirim notifikasi...")
+                          send_telegram("Peringatan: Auto-solve NECaptcha gagal hari ini. Perlu intervensi manual.")
+                          await browser.close()
+                          return None
+
+                      await page.wait_for_timeout(2000)
+                      token = await capture_token(page)
+                      if token:
+                          print(f"[MAIN] Token: {token}")
+                          send_telegram(f"NECaptcha Token:\n{token}")
+                      else:
+                          print("[MAIN] Token tidak ditemukan.")
+                      await browser.close()
+                      return token
+              except Exception:
+                  print("[MAIN] Exception:")
+                  traceback.print_exc()
+                  return None
+
+          if __name__ == "__main__":
+              while True:
+                  print("[LOOP] Memulai iterasi baru...")
+                  token = asyncio.run(main())
+                  wait = 30 if token else 10
+                  print(f"[LOOP] Menunggu {wait} detik...")
+                  time.sleep(wait)
+          PYEOF
+
+      - name: Run farmer with Xvfb
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" python farm.py
